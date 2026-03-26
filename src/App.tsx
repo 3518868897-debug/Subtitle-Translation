@@ -10,8 +10,10 @@ import { SubtitleStyler } from './components/SubtitleStyler';
 import { ExportSettings } from './components/ExportSettings';
 import { extractAudio, exportVideo, SubtitleStyle } from './lib/ffmpeg';
 import { transcribeAudio, translateSubtitles, SubtitleSegment } from './lib/gemini';
-import { Languages, Wand2, FileAudio, CheckCircle2, AlertCircle, Timer, Play } from 'lucide-react';
-import { motion, AnimatePresence } from 'framer-motion';
+import { downloadSRT } from './lib/srt';
+import { Languages, Wand2, FileAudio, CheckCircle2, AlertCircle, Timer, Play, Settings, FileText } from 'lucide-react';
+import { motion, AnimatePresence } from 'motion/react';
+import { ApiKeySettings } from './components/ApiKeySettings';
 
 export default function App() {
   const [videoFile, setVideoFile] = useState<File | null>(null);
@@ -23,6 +25,8 @@ export default function App() {
   const [processStep, setProcessStep] = useState<string>('');
   const [stepProgress, setStepProgress] = useState(0);
   const [error, setError] = useState<string>('');
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [userApiKey, setUserApiKey] = useState<string>(localStorage.getItem('gemini_api_key') || '');
   
   const [style, setStyle] = useState<SubtitleStyle>({
     fontSize: 24,
@@ -101,7 +105,7 @@ export default function App() {
       setStepProgress(35);
       simInterval = simulateProgress(35, 95, 30000); // 35% to 95% over 30s
       
-      const transcription = await transcribeAudio(audioBlob);
+      const transcription = await transcribeAudio(audioBlob, userApiKey);
       
       if (simInterval) clearInterval(simInterval);
       setStepProgress(100);
@@ -133,7 +137,7 @@ export default function App() {
       setProcessStep(`Translating to ${targetLanguage}...`);
       simInterval = simulateProgress(0, 95, 15000); // 0% to 95% over 15s
       
-      const translation = await translateSubtitles(originalSubtitles, targetLanguage);
+      const translation = await translateSubtitles(originalSubtitles, targetLanguage, userApiKey);
       
       if (simInterval) clearInterval(simInterval);
       setStepProgress(100);
@@ -186,9 +190,16 @@ export default function App() {
     }
   };
 
+  const handleExportSRT = () => {
+    if (translatedSubtitles.length === 0 || !videoFile) return;
+    const name = videoFile.name.split('.').slice(0, -1).join('.');
+    downloadSRT(translatedSubtitles, `${name}_${targetLanguage}.srt`);
+  };
+
   const languages = [
     'English', 'Chinese (Simplified)', 'Chinese (Traditional)', 'Spanish', 
-    'French', 'German', 'Japanese', 'Korean', 'Russian', 'Arabic'
+    'French', 'German', 'Japanese', 'Korean', 'Russian', 'Arabic',
+    'Indonesian', 'Portuguese (Brazil)', 'Portuguese (Portugal)'
   ];
 
   return (
@@ -203,6 +214,17 @@ export default function App() {
               GlobalSubs AI
             </h1>
           </div>
+          
+          <button
+            onClick={() => setIsSettingsOpen(true)}
+            className="flex items-center gap-2 px-3 py-1.5 rounded-lg border border-gray-200 hover:bg-gray-50 transition-colors text-sm font-medium text-gray-600"
+          >
+            <Settings className="w-4 h-4" />
+            <span className="hidden sm:inline">Settings</span>
+            {!userApiKey && (
+              <span className="flex h-2 w-2 rounded-full bg-red-500 animate-pulse"></span>
+            )}
+          </button>
         </div>
       </header>
 
@@ -484,36 +506,51 @@ export default function App() {
           <div className="lg:col-span-7 space-y-6">
             <AnimatePresence mode="wait">
               {originalSubtitles.length > 0 && (
-                <motion.div
-                  initial={{ opacity: 0, y: 20 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  className="grid grid-cols-1 md:grid-cols-2 gap-4 h-[500px]"
-                >
-                  <TranscriptionEditor
-                    title="Original Text"
-                    subtitles={originalSubtitles}
-                    onSubtitlesChange={setOriginalSubtitles}
-                    currentTime={currentTime}
-                    onSeek={(time) => {
-                      if (videoRef.current) {
-                        videoRef.current.currentTime = time;
-                        videoRef.current.play();
-                      }
-                    }}
-                  />
-                  <TranscriptionEditor
-                    title={`Translated (${targetLanguage})`}
-                    subtitles={translatedSubtitles}
-                    onSubtitlesChange={setTranslatedSubtitles}
-                    currentTime={currentTime}
-                    onSeek={(time) => {
-                      if (videoRef.current) {
-                        videoRef.current.currentTime = time;
-                        videoRef.current.play();
-                      }
-                    }}
-                  />
-                </motion.div>
+                <>
+                  <div className="bg-blue-50 border border-blue-100 rounded-lg p-3 mb-4">
+                    <p className="text-[11px] text-blue-700 leading-relaxed flex items-center gap-2">
+                      <FileText className="w-3 h-3" />
+                      <strong>Tip:</strong> You can import an existing SRT file (e.g. from CapCut) using the "Import SRT" button above to use its exact timing and text as the source.
+                    </p>
+                  </div>
+                  <motion.div
+                    initial={{ opacity: 0, y: 20 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    className="grid grid-cols-1 md:grid-cols-2 gap-4 h-[500px]"
+                  >
+                    <TranscriptionEditor
+                      title="Original Text"
+                      subtitles={originalSubtitles}
+                      onSubtitlesChange={(newSubs) => {
+                        setOriginalSubtitles(newSubs);
+                        // Also update translated subtitles if they were the same
+                        if (translatedSubtitles === originalSubtitles) {
+                          setTranslatedSubtitles(newSubs);
+                        }
+                      }}
+                      currentTime={currentTime}
+                      allowImport={true}
+                      onSeek={(time) => {
+                        if (videoRef.current) {
+                          videoRef.current.currentTime = time;
+                          videoRef.current.play();
+                        }
+                      }}
+                    />
+                    <TranscriptionEditor
+                      title={`Translated (${targetLanguage})`}
+                      subtitles={translatedSubtitles}
+                      onSubtitlesChange={setTranslatedSubtitles}
+                      currentTime={currentTime}
+                      onSeek={(time) => {
+                        if (videoRef.current) {
+                          videoRef.current.currentTime = time;
+                          videoRef.current.play();
+                        }
+                      }}
+                    />
+                  </motion.div>
+                </>
               )}
             </AnimatePresence>
 
@@ -538,6 +575,7 @@ export default function App() {
                   resolution={resolution}
                   onResolutionChange={setResolution}
                   onExport={handleExport}
+                  onExportSRT={handleExportSRT}
                   isExporting={isExporting}
                   progress={exportProgress}
                 />
@@ -546,6 +584,12 @@ export default function App() {
           </div>
         </div>
       </main>
+
+      <ApiKeySettings 
+        isOpen={isSettingsOpen} 
+        onClose={() => setIsSettingsOpen(false)} 
+        onKeySave={setUserApiKey}
+      />
     </div>
   );
 }

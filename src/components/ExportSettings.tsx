@@ -1,10 +1,11 @@
 import React from 'react';
-import { Download, MonitorPlay } from 'lucide-react';
+import { Download, MonitorPlay, FileText } from 'lucide-react';
 
 interface ExportSettingsProps {
   resolution: string;
   onResolutionChange: (res: string) => void;
   onExport: () => void;
+  onExportSRT: () => void;
   isExporting: boolean;
   progress: number;
 }
@@ -13,6 +14,7 @@ export const ExportSettings: React.FC<ExportSettingsProps> = ({
   resolution,
   onResolutionChange,
   onExport,
+  onExportSRT,
   isExporting,
   progress,
 }) => {
@@ -30,29 +32,47 @@ export const ExportSettings: React.FC<ExportSettingsProps> = ({
         <h3 className="text-lg font-semibold text-gray-900">Export Settings</h3>
       </div>
 
-      <div className="space-y-4">
-        <label className="text-sm font-medium text-gray-700 block">Select Resolution</label>
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-          {resolutions.map((res) => (
-            <button
-              key={res.id}
-              onClick={() => onResolutionChange(res.id)}
-              className={`px-4 py-3 rounded-lg text-sm font-medium transition-all ${
-                resolution === res.id
-                  ? 'bg-blue-600 text-white shadow-md shadow-blue-200'
-                  : 'bg-gray-50 text-gray-700 hover:bg-gray-100 border border-gray-200'
-              }`}
-            >
-              {res.label}
-            </button>
-          ))}
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+        <div className="space-y-4">
+          <label className="text-sm font-medium text-gray-700 block">Select Resolution</label>
+          <div className="grid grid-cols-2 gap-3">
+            {resolutions.map((res) => (
+              <button
+                key={res.id}
+                onClick={() => onResolutionChange(res.id)}
+                className={`px-4 py-3 rounded-lg text-sm font-medium transition-all ${
+                  resolution === res.id
+                    ? 'bg-blue-600 text-white shadow-md shadow-blue-200'
+                    : 'bg-gray-50 text-gray-700 hover:bg-gray-100 border border-gray-200'
+                }`}
+              >
+                {res.label}
+              </button>
+            ))}
+          </div>
+          <p className="text-xs text-gray-500 italic mt-2">
+            Tip: Lower resolutions (like 1080p) export significantly faster than 4K.
+          </p>
         </div>
-        <p className="text-xs text-gray-500 italic mt-2">
-          Tip: Lower resolutions (like 1080p) export significantly faster than 4K.
-        </p>
+
+        <div className="space-y-4">
+          <label className="text-sm font-medium text-gray-700 block">Subtitle Export</label>
+          <div className="space-y-3">
+            <button
+              onClick={onExportSRT}
+              className="w-full flex items-center justify-center gap-2 py-3 px-4 rounded-xl border-2 border-dashed border-gray-200 text-gray-600 hover:border-blue-400 hover:text-blue-600 hover:bg-blue-50 transition-all font-medium group"
+            >
+              <FileText className="w-5 h-5 text-gray-400 group-hover:text-blue-500" />
+              Download SRT File
+            </button>
+            <p className="text-[11px] text-gray-400 leading-relaxed">
+              SRT files are compatible with CapCut (剪映), Premiere Pro, and most video players.
+            </p>
+          </div>
+        </div>
       </div>
 
-      <div className="pt-4 space-y-4">
+      <div className="pt-4 space-y-4 border-t border-gray-100">
         {isExporting && (
           <div className="space-y-2">
             <div className="flex justify-between text-sm text-gray-600 font-medium">

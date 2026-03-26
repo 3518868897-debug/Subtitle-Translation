@@ -1,6 +1,7 @@
-import React from 'react';
+import React, { useRef } from 'react';
 import { SubtitleSegment } from '../lib/gemini';
-import { Clock, Edit3, Play, ArrowRight, Timer } from 'lucide-react';
+import { Clock, Edit3, Play, ArrowRight, Timer, Upload, FileText } from 'lucide-react';
+import { parseSRT } from '../lib/srt';
 
 interface TranscriptionEditorProps {
   subtitles: SubtitleSegment[];
@@ -8,6 +9,7 @@ interface TranscriptionEditorProps {
   title: string;
   currentTime?: number;
   onSeek?: (time: number) => void;
+  allowImport?: boolean;
 }
 
 export const TranscriptionEditor: React.FC<TranscriptionEditorProps> = ({
@@ -16,7 +18,43 @@ export const TranscriptionEditor: React.FC<TranscriptionEditorProps> = ({
   title,
   currentTime = 0,
   onSeek,
+  allowImport = false,
 }) => {
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [importStatus, setImportStatus] = React.useState<{ type: 'success' | 'error', message: string } | null>(null);
+
+  const handleImportSRT = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      const content = event.target?.result as string;
+      if (content) {
+        try {
+          const parsed = parseSRT(content);
+          if (parsed.length > 0) {
+            onSubtitlesChange(parsed);
+            setImportStatus({ type: 'success', message: `Successfully imported ${parsed.length} segments.` });
+          } else {
+            setImportStatus({ type: 'error', message: 'No valid subtitle segments found in the file.' });
+          }
+        } catch (err) {
+          console.error('SRT Parse Error:', err);
+          setImportStatus({ type: 'error', message: 'Failed to parse the SRT file. Please check the format.' });
+        }
+      }
+    };
+    reader.onerror = () => {
+      setImportStatus({ type: 'error', message: 'Failed to read the file.' });
+    };
+    reader.readAsText(file);
+    // Reset input
+    if (fileInputRef.current) fileInputRef.current.value = '';
+
+    // Clear status after 3 seconds
+    setTimeout(() => setImportStatus(null), 3000);
+  };
   const handleTextChange = (index: number, newText: string) => {
     const newSubtitles = [...subtitles];
     newSubtitles[index] = { ...newSubtitles[index], text: newText };
@@ -64,10 +102,38 @@ export const TranscriptionEditor: React.FC<TranscriptionEditorProps> = ({
   return (
     <div className="bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden flex flex-col h-full max-h-[600px]">
       <div className="bg-gray-50 px-6 py-4 border-b border-gray-200 flex items-center justify-between">
-        <h3 className="text-lg font-semibold text-gray-900 flex items-center gap-2">
-          <Edit3 className="w-5 h-5 text-gray-500" />
-          {title}
-        </h3>
+        <div className="flex items-center gap-4">
+          <h3 className="text-lg font-semibold text-gray-900 flex items-center gap-2">
+            <Edit3 className="w-5 h-5 text-gray-500" />
+            {title}
+          </h3>
+          {allowImport && (
+            <div className="flex items-center gap-2">
+              <input
+                type="file"
+                accept=".srt,.txt,text/plain"
+                ref={fileInputRef}
+                onChange={handleImportSRT}
+                className="hidden"
+              />
+              <button
+                onClick={() => fileInputRef.current?.click()}
+                className="flex items-center gap-1.5 px-3 py-1 bg-white border border-gray-200 rounded-lg text-xs font-bold text-blue-600 hover:bg-blue-50 transition-all shadow-sm active:scale-95"
+                title="Import SRT file to overwrite original text"
+              >
+                <Upload className="w-3 h-3" />
+                Import SRT
+              </button>
+              {importStatus && (
+                <span className={`text-[10px] font-medium px-2 py-0.5 rounded-full animate-in fade-in slide-in-from-left-2 duration-300 shadow-sm ${
+                  importStatus.type === 'success' ? 'bg-green-100 text-green-700 border border-green-200' : 'bg-red-100 text-red-700 border border-red-200'
+                }`}>
+                  {importStatus.message}
+                </span>
+              )}
+            </div>
+          )}
+        </div>
         <span className="text-sm text-gray-500">{subtitles.length} segments</span>
       </div>
       <div ref={scrollRef} className="overflow-y-auto flex-1 p-4 space-y-3">
