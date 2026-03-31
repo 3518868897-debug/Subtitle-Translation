@@ -86,6 +86,17 @@ export const getFFmpeg = async (): Promise<FFmpeg> => {
   return ffmpeg;
 };
 
+export const terminateFFmpeg = () => {
+  if (ffmpeg) {
+    try {
+      ffmpeg.terminate();
+    } catch (e) {
+      console.error('Error terminating FFmpeg:', e);
+    }
+    ffmpeg = null;
+  }
+};
+
 export const extractAudio = async (videoFile: File, onProgress?: (progress: number) => void): Promise<Blob> => {
   console.log('Starting extractAudio...');
   const ff = await getFFmpeg();

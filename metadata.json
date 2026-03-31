@@ -1,5 +1,5 @@
 {
   "name": "字幕翻译",
-  "description": "Upload videos and automatically translate subtitles into multiple languages with AI. Edit subtitles, customize styling, and export in 4K.",
+  "description": "AI 视频翻译工具：自动识别语音生成字幕，支持多种语言一键翻译。支持 SRT 导入导出、字幕样式自定义及 4K 视频导出。",
   "requestFramePermissions": []
 }

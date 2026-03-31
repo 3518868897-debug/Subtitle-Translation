@@ -8,12 +8,23 @@ import { VideoUploader } from './components/VideoUploader';
 import { TranscriptionEditor } from './components/TranscriptionEditor';
 import { SubtitleStyler } from './components/SubtitleStyler';
 import { ExportSettings } from './components/ExportSettings';
-import { extractAudio, exportVideo, SubtitleStyle } from './lib/ffmpeg';
+import { extractAudio, exportVideo, SubtitleStyle, terminateFFmpeg } from './lib/ffmpeg';
 import { transcribeAudio, translateSubtitles, SubtitleSegment } from './lib/gemini';
-import { downloadSRT } from './lib/srt';
-import { Languages, Wand2, FileAudio, CheckCircle2, AlertCircle, Timer, Play, Settings, FileText } from 'lucide-react';
+import { downloadSRT, parseSRT } from './lib/srt';
 import { motion, AnimatePresence } from 'motion/react';
+import JSZip from 'jszip';
 import { ApiKeySettings } from './components/ApiKeySettings';
+import { UserManual } from './components/UserManual';
+import { BookOpen, Languages, Wand2, FileAudio, CheckCircle2, AlertCircle, Timer, Play, Settings, FileText, Plus, Trash2, DownloadCloud, PlayCircle, Loader2, ListChecks } from 'lucide-react';
+
+interface TranslationWorkflow {
+  id: string;
+  language: string;
+  subtitles: SubtitleSegment[];
+  status: 'idle' | 'translating' | 'completed' | 'error';
+  progress: number;
+  error?: string;
+}
 
 export default function App() {
   const [videoFile, setVideoFile] = useState<File | null>(null);
@@ -26,7 +37,10 @@ export default function App() {
   const [stepProgress, setStepProgress] = useState(0);
   const [error, setError] = useState<string>('');
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [isManualOpen, setIsManualOpen] = useState(false);
   const [userApiKey, setUserApiKey] = useState<string>(localStorage.getItem('gemini_api_key') || '');
+  const [workflows, setWorkflows] = useState<TranslationWorkflow[]>([]);
+  const [activeWorkflowId, setActiveWorkflowId] = useState<string | null>(null);
   
   const [style, setStyle] = useState<SubtitleStyle>({
     fontSize: 24,
@@ -38,8 +52,55 @@ export default function App() {
   const [isExporting, setIsExporting] = useState(false);
   const [exportProgress, setExportProgress] = useState(0);
   const [currentTime, setCurrentTime] = useState(0);
+  const [isWidgetMode, setIsWidgetMode] = useState(false);
 
   const videoRef = useRef<HTMLVideoElement>(null);
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('mode') === 'widget') {
+      setIsWidgetMode(true);
+    }
+
+    const handleMessage = async (event: MessageEvent) => {
+      // Basic security: you can add origin checks here if needed
+      // if (event.origin !== "https://your-trusted-domain.com") return;
+
+      const { type, payload } = event.data;
+
+      switch (type) {
+        case 'LOAD_VIDEO_URL':
+          if (payload?.url) {
+            try {
+              const response = await fetch(payload.url);
+              const blob = await response.blob();
+              const file = new File([blob], payload.name || "external_video.mp4", { type: blob.type });
+              handleVideoSelect(file);
+            } catch (err) {
+              setError('Failed to load video from URL: ' + (err as Error).message);
+            }
+          }
+          break;
+        case 'LOAD_SRT_CONTENT':
+          if (payload?.content) {
+            const subs = parseSRT(payload.content);
+            setOriginalSubtitles(subs);
+            setTranslatedSubtitles(subs);
+            setError('');
+          }
+          break;
+        case 'SET_API_KEY':
+          if (payload?.apiKey) {
+            setUserApiKey(payload.apiKey);
+            localStorage.setItem('gemini_api_key', payload.apiKey);
+          }
+          break;
+      }
+    };
+
+    window.addEventListener('message', handleMessage);
+    return () => window.removeEventListener('message', handleMessage);
+  }, []);
 
   useEffect(() => {
     if (videoFile) {
@@ -55,6 +116,148 @@ export default function App() {
     setTranslatedSubtitles([]);
     setError('');
     setCurrentTime(0);
+  };
+
+  const handleSrtSelect = async (file: File) => {
+    try {
+      const text = await file.text();
+      const subs = parseSRT(text);
+      if (subs.length === 0) {
+        throw new Error('Invalid or empty SRT file.');
+      }
+      setOriginalSubtitles(subs);
+      setTranslatedSubtitles(subs);
+      
+      // Add initial workflow
+      const workflowId = Math.random().toString(36).substr(2, 9);
+      const newWorkflow: TranslationWorkflow = {
+        id: workflowId,
+        language: targetLanguage,
+        subtitles: subs,
+        status: 'idle',
+        progress: 0,
+      };
+      setWorkflows([newWorkflow]);
+      setActiveWorkflowId(workflowId);
+      
+      setError('');
+    } catch (err: any) {
+      setError(err.message || 'Failed to parse SRT file.');
+    }
+  };
+
+  const handleCancelExport = () => {
+    terminateFFmpeg();
+    setIsExporting(false);
+    setExportProgress(0);
+    setProcessStep('');
+  };
+
+  const addWorkflow = () => {
+    const workflowId = Math.random().toString(36).substr(2, 9);
+    const newWorkflow: TranslationWorkflow = {
+      id: workflowId,
+      language: targetLanguage,
+      subtitles: originalSubtitles,
+      status: 'idle',
+      progress: 0,
+    };
+    setWorkflows([...workflows, newWorkflow]);
+    if (workflows.length === 0) {
+      setActiveWorkflowId(workflowId);
+    }
+  };
+
+  const removeWorkflow = (id: string) => {
+    setWorkflows(workflows.filter(w => w.id !== id));
+  };
+
+  const updateWorkflowLanguage = (id: string, language: string) => {
+    setWorkflows(workflows.map(w => w.id === id ? { ...w, language, status: 'idle' } : w));
+  };
+
+  const translateWorkflow = async (id: string) => {
+    const workflow = workflows.find(w => w.id === id);
+    if (!workflow || originalSubtitles.length === 0) return;
+
+    setWorkflows(prev => prev.map(w => w.id === id ? { ...w, status: 'translating', progress: 0, error: undefined } : w));
+
+    let progress = 0;
+    const interval = setInterval(() => {
+      progress += Math.random() * 5;
+      if (progress > 95) clearInterval(interval);
+      setWorkflows(prev => prev.map(w => w.id === id ? { ...w, progress: Math.min(95, progress) } : w));
+    }, 500);
+
+    try {
+      const translation = await translateSubtitles(originalSubtitles, workflow.language, userApiKey);
+      clearInterval(interval);
+      setWorkflows(prev => prev.map(w => w.id === id ? { ...w, subtitles: translation, status: 'completed', progress: 100 } : w));
+      
+      // If this is the first completed or currently selected, update preview
+      if (targetLanguage === workflow.language) {
+        setTranslatedSubtitles(translation);
+      }
+    } catch (err: any) {
+      clearInterval(interval);
+      setWorkflows(prev => prev.map(w => w.id === id ? { ...w, status: 'error', error: err.message || 'Translation failed' } : w));
+    }
+  };
+
+  const translateAllWorkflows = async () => {
+    const idleWorkflows = workflows.filter(w => w.status === 'idle' || w.status === 'error');
+    for (const workflow of idleWorkflows) {
+      await translateWorkflow(workflow.id);
+    }
+  };
+
+  const batchDownloadWorkflows = async () => {
+    const completedWorkflows = workflows.filter(w => w.status === 'completed');
+    if (completedWorkflows.length === 0) return;
+
+    if (completedWorkflows.length === 1) {
+      const w = completedWorkflows[0];
+      const name = videoFile ? videoFile.name.split('.').slice(0, -1).join('.') : 'translated_subtitles';
+      downloadSRT(w.subtitles, `${name}_${w.language}.srt`);
+      return;
+    }
+
+    const zip = new JSZip();
+    const baseName = videoFile ? videoFile.name.split('.').slice(0, -1).join('.') : 'translated_subtitles';
+
+    completedWorkflows.forEach(w => {
+      // Generate SRT content
+      const srtContent = w.subtitles.map((sub, i) => {
+        const formatTime = (seconds: number) => {
+          const date = new Date(seconds * 1000);
+          const hh = String(date.getUTCHours()).padStart(2, '0');
+          const mm = String(date.getUTCMinutes()).padStart(2, '0');
+          const ss = String(date.getUTCSeconds()).padStart(2, '0');
+          const ms = String(date.getUTCMilliseconds()).padStart(3, '0');
+          return `${hh}:${mm}:${ss},${ms}`;
+        };
+        return `${i + 1}\n${formatTime(sub.start)} --> ${formatTime(sub.end)}\n${sub.text}\n`;
+      }).join('\n');
+      
+      zip.file(`${baseName}_${w.language}.srt`, srtContent);
+    });
+
+    const content = await zip.generateAsync({ type: 'blob' });
+    const url = URL.createObjectURL(content);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${baseName}_translations.zip`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  const handleTranslatedSubtitlesChange = (newSubs: SubtitleSegment[]) => {
+    setTranslatedSubtitles(newSubs);
+    if (activeWorkflowId) {
+      setWorkflows(prev => prev.map(w => w.id === activeWorkflowId ? { ...w, subtitles: newSubs } : w));
+    }
   };
 
   const simulateProgress = (start: number, end: number, durationMs: number) => {
@@ -112,40 +315,14 @@ export default function App() {
       
       setOriginalSubtitles(transcription);
       setTranslatedSubtitles(transcription); // Default to original
+
+      // Notify parent if embedded
+      if (window.parent !== window) {
+        window.parent.postMessage({ type: 'TRANSCRIPTION_COMPLETED', payload: { subtitles: transcription } }, '*');
+      }
     } catch (err: any) {
       if (simInterval) clearInterval(simInterval);
       setError(err.message || 'An error occurred during transcription. Please try again.');
-      window.scrollTo({ top: 0, behavior: 'smooth' });
-    } finally {
-      setTimeout(() => {
-        setProcessingType(null);
-        setProcessStep('');
-        setStepProgress(0);
-      }, 500);
-    }
-  };
-
-  const handleTranslate = async () => {
-    if (originalSubtitles.length === 0) return;
-    setProcessingType('translate');
-    setError('');
-    setStepProgress(0);
-    
-    let simInterval: ReturnType<typeof setInterval> | null = null;
-    
-    try {
-      setProcessStep(`Translating to ${targetLanguage}...`);
-      simInterval = simulateProgress(0, 95, 15000); // 0% to 95% over 15s
-      
-      const translation = await translateSubtitles(originalSubtitles, targetLanguage, userApiKey);
-      
-      if (simInterval) clearInterval(simInterval);
-      setStepProgress(100);
-      
-      setTranslatedSubtitles(translation);
-    } catch (err: any) {
-      if (simInterval) clearInterval(simInterval);
-      setError(err.message || 'An error occurred during translation. Please try again.');
       window.scrollTo({ top: 0, behavior: 'smooth' });
     } finally {
       setTimeout(() => {
@@ -179,6 +356,11 @@ export default function App() {
       a.click();
       document.body.removeChild(a);
       URL.revokeObjectURL(url);
+
+      // Notify parent if embedded
+      if (window.parent !== window) {
+        window.parent.postMessage({ type: 'EXPORT_COMPLETED', payload: { success: true } }, '*');
+      }
     } catch (err: any) {
       setError(err.message || 'An error occurred during export. Please try again.');
       window.scrollTo({ top: 0, behavior: 'smooth' });
@@ -191,8 +373,8 @@ export default function App() {
   };
 
   const handleExportSRT = () => {
-    if (translatedSubtitles.length === 0 || !videoFile) return;
-    const name = videoFile.name.split('.').slice(0, -1).join('.');
+    if (translatedSubtitles.length === 0) return;
+    const name = videoFile ? videoFile.name.split('.').slice(0, -1).join('.') : 'translated_subtitles';
     downloadSRT(translatedSubtitles, `${name}_${targetLanguage}.srt`);
   };
 
@@ -203,32 +385,43 @@ export default function App() {
   ];
 
   return (
-    <div className="min-h-screen bg-gray-50 text-gray-900 font-sans selection:bg-blue-200">
-      <header className="bg-white border-b border-gray-200 sticky top-0 z-10">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <div className="bg-blue-600 p-2 rounded-lg">
-              <Languages className="w-5 h-5 text-white" />
+    <div className={`min-h-screen bg-gray-50 text-gray-900 font-sans selection:bg-blue-200 ${isWidgetMode ? 'p-0' : ''}`}>
+      {!isWidgetMode && (
+        <header className="bg-white border-b border-gray-200 sticky top-0 z-10">
+          <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <div className="bg-blue-600 p-2 rounded-lg">
+                <Languages className="w-5 h-5 text-white" />
+              </div>
+              <h1 className="text-xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-blue-600 to-indigo-600">
+                GlobalSubs AI
+              </h1>
             </div>
-            <h1 className="text-xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-blue-600 to-indigo-600">
-              GlobalSubs AI
-            </h1>
+            
+            <div className="flex items-center gap-3">
+              <button
+                onClick={() => setIsManualOpen(true)}
+                className="flex items-center gap-2 px-3 py-1.5 rounded-lg border border-gray-200 hover:bg-gray-50 transition-colors text-sm font-medium text-gray-600"
+              >
+                <BookOpen className="w-4 h-4" />
+                <span className="hidden sm:inline">User Manual</span>
+              </button>
+              <button
+                onClick={() => setIsSettingsOpen(true)}
+                className="flex items-center gap-2 px-3 py-1.5 rounded-lg border border-gray-200 hover:bg-gray-50 transition-colors text-sm font-medium text-gray-600"
+              >
+                <Settings className="w-4 h-4" />
+                <span className="hidden sm:inline">Settings</span>
+                {!userApiKey && (
+                  <span className="flex h-2 w-2 rounded-full bg-red-500 animate-pulse"></span>
+                )}
+              </button>
+            </div>
           </div>
-          
-          <button
-            onClick={() => setIsSettingsOpen(true)}
-            className="flex items-center gap-2 px-3 py-1.5 rounded-lg border border-gray-200 hover:bg-gray-50 transition-colors text-sm font-medium text-gray-600"
-          >
-            <Settings className="w-4 h-4" />
-            <span className="hidden sm:inline">Settings</span>
-            {!userApiKey && (
-              <span className="flex h-2 w-2 rounded-full bg-red-500 animate-pulse"></span>
-            )}
-          </button>
-        </div>
-      </header>
+        </header>
+      )}
 
-      <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-8">
+      <main className={`${isWidgetMode ? 'max-w-full p-4' : 'max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8'} space-y-8`}>
         {error && (
           <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded-xl flex flex-col gap-3">
             <div className="flex items-center gap-3">
@@ -249,9 +442,9 @@ export default function App() {
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
           {/* Left Column: Video & Controls */}
           <div className="lg:col-span-5 space-y-6">
-            {!videoFile ? (
-              <VideoUploader onVideoSelect={handleVideoSelect} />
-            ) : (
+            {!videoFile && originalSubtitles.length === 0 ? (
+              <VideoUploader onVideoSelect={handleVideoSelect} onSrtSelect={handleSrtSelect} />
+            ) : videoFile ? (
               <div className="bg-black rounded-xl overflow-hidden shadow-lg border border-gray-800 relative group @container">
                 <video
                   ref={videoRef}
@@ -309,6 +502,25 @@ export default function App() {
                     Change Video
                   </button>
                 </div>
+              </div>
+            ) : (
+              <div className="bg-white p-8 rounded-xl border border-gray-200 text-center space-y-4">
+                <div className="bg-indigo-50 w-16 h-16 rounded-full flex items-center justify-center mx-auto">
+                  <FileText className="w-8 h-8 text-indigo-600" />
+                </div>
+                <div>
+                  <h3 className="text-lg font-bold text-gray-900">SRT Translation Mode</h3>
+                  <p className="text-sm text-gray-500">You are translating an SRT file without a video preview.</p>
+                </div>
+                <button 
+                  onClick={() => {
+                    setOriginalSubtitles([]);
+                    setTranslatedSubtitles([]);
+                  }}
+                  className="text-sm text-indigo-600 font-bold hover:underline"
+                >
+                  ← Back to Upload
+                </button>
               </div>
             )}
 
@@ -449,55 +661,130 @@ export default function App() {
             )}
 
             {originalSubtitles.length > 0 && (
-              <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-200 space-y-4">
+              <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-200 space-y-6">
                 <div className="flex items-center justify-between">
-                  <h3 className="font-semibold text-gray-900 flex items-center gap-2">
-                    <Languages className="w-5 h-5 text-indigo-500" />
-                    Step 2: Translate
-                  </h3>
-                  {translatedSubtitles !== originalSubtitles && (
-                    <span className="text-xs font-medium text-green-600 bg-green-50 px-2 py-1 rounded-full flex items-center gap-1">
-                      <CheckCircle2 className="w-3 h-3" /> Translated
-                    </span>
-                  )}
-                </div>
-                
-                <div className="space-y-3">
-                  <label className="text-sm font-medium text-gray-700 block">Target Language</label>
-                  <select
-                    value={targetLanguage}
-                    onChange={(e) => setTargetLanguage(e.target.value)}
-                    className="w-full bg-gray-50 border border-gray-200 text-gray-900 rounded-lg focus:ring-blue-500 focus:border-blue-500 block p-2.5"
-                  >
-                    {languages.map((lang) => (
-                      <option key={lang} value={lang}>{lang}</option>
-                    ))}
-                  </select>
+                  <div className="flex items-center gap-2">
+                    <ListChecks className="w-5 h-5 text-indigo-500" />
+                    <h3 className="font-semibold text-gray-900">Translation Workflows</h3>
+                  </div>
+                  <div className="flex gap-2">
+                    <button
+                      onClick={translateAllWorkflows}
+                      disabled={workflows.filter(w => w.status === 'idle' || w.status === 'error').length === 0}
+                      className="text-xs font-bold text-indigo-600 hover:bg-indigo-50 px-3 py-1.5 rounded-lg transition-all flex items-center gap-1 disabled:opacity-50"
+                    >
+                      <PlayCircle className="w-4 h-4" />
+                      Translate All
+                    </button>
+                    <button
+                      onClick={batchDownloadWorkflows}
+                      disabled={workflows.filter(w => w.status === 'completed').length === 0}
+                      className="text-xs font-bold text-green-600 hover:bg-green-50 px-3 py-1.5 rounded-lg transition-all flex items-center gap-1 disabled:opacity-50"
+                    >
+                      <DownloadCloud className="w-4 h-4" />
+                      Batch Download
+                    </button>
+                  </div>
                 </div>
 
-                {processingType === 'translate' ? (
-                  <div className="w-full space-y-2 pt-2">
-                    <div className="flex justify-between text-sm text-gray-600 font-medium">
-                      <span>{processStep}</span>
-                      <span>{Math.round(stepProgress)}%</span>
+                <div className="space-y-3">
+                  {workflows.map((workflow) => (
+                    <div 
+                      key={workflow.id}
+                      className={`p-4 rounded-xl border transition-all ${
+                        targetLanguage === workflow.language 
+                          ? 'border-indigo-200 bg-indigo-50/30' 
+                          : 'border-gray-100 bg-gray-50/50'
+                      }`}
+                    >
+                      <div className="flex items-center justify-between mb-3">
+                        <div className="flex items-center gap-3">
+                          <select
+                            value={workflow.language}
+                            onChange={(e) => updateWorkflowLanguage(workflow.id, e.target.value)}
+                            disabled={workflow.status === 'translating'}
+                            className="bg-white border border-gray-200 text-sm rounded-lg px-2 py-1 focus:ring-indigo-500 focus:border-indigo-500"
+                          >
+                            {languages.map((lang) => (
+                              <option key={lang} value={lang}>{lang}</option>
+                            ))}
+                          </select>
+                          <div className="flex items-center gap-2">
+                            {workflow.status === 'translating' && (
+                              <Loader2 className="w-3 h-3 text-indigo-500 animate-spin" />
+                            )}
+                            {workflow.status === 'completed' && (
+                              <CheckCircle2 className="w-3 h-3 text-green-500" />
+                            )}
+                            {workflow.status === 'error' && (
+                              <AlertCircle className="w-3 h-3 text-red-500" />
+                            )}
+                            <span className={`text-[10px] font-bold uppercase tracking-wider ${
+                              workflow.status === 'translating' ? 'text-indigo-600' :
+                              workflow.status === 'completed' ? 'text-green-600' :
+                              workflow.status === 'error' ? 'text-red-600' : 'text-gray-400'
+                            }`}>
+                              {workflow.status}
+                            </span>
+                          </div>
+                        </div>
+                        <div className="flex items-center gap-1">
+                          <button
+                            onClick={() => {
+                              setTargetLanguage(workflow.language);
+                              setActiveWorkflowId(workflow.id);
+                              setTranslatedSubtitles(workflow.subtitles);
+                            }}
+                            className={`p-1.5 rounded-lg transition-all ${
+                              targetLanguage === workflow.language && activeWorkflowId === workflow.id
+                                ? 'bg-indigo-600 text-white' 
+                                : 'hover:bg-gray-200 text-gray-500'
+                            }`}
+                            title="Select for Preview"
+                          >
+                            <Play className="w-4 h-4" />
+                          </button>
+                          <button
+                            onClick={() => translateWorkflow(workflow.id)}
+                            disabled={workflow.status === 'translating'}
+                            className="p-1.5 hover:bg-indigo-100 text-indigo-600 rounded-lg transition-all disabled:opacity-50"
+                            title="Translate"
+                          >
+                            <Wand2 className="w-4 h-4" />
+                          </button>
+                          <button
+                            onClick={() => removeWorkflow(workflow.id)}
+                            className="p-1.5 hover:bg-red-100 text-red-600 rounded-lg transition-all"
+                            title="Remove"
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </button>
+                        </div>
+                      </div>
+
+                      {workflow.status === 'translating' && (
+                        <div className="w-full bg-gray-200 rounded-full h-1.5 overflow-hidden">
+                          <div 
+                            className="bg-indigo-600 h-1.5 rounded-full transition-all duration-300" 
+                            style={{ width: `${workflow.progress}%` }}
+                          ></div>
+                        </div>
+                      )}
+                      
+                      {workflow.status === 'error' && (
+                        <p className="text-[10px] text-red-600 mt-1">{workflow.error}</p>
+                      )}
                     </div>
-                    <div className="w-full bg-indigo-100 rounded-full h-2.5 overflow-hidden">
-                      <div 
-                        className="bg-indigo-600 h-2.5 rounded-full transition-all duration-300" 
-                        style={{ width: `${Math.max(0, Math.min(100, stepProgress))}%` }}
-                      ></div>
-                    </div>
-                  </div>
-                ) : (
+                  ))}
+
                   <button
-                    onClick={handleTranslate}
-                    disabled={processingType !== null}
-                    className="w-full bg-indigo-600 hover:bg-indigo-700 text-white py-3 rounded-lg font-medium transition-colors flex items-center justify-center gap-2 disabled:opacity-50"
+                    onClick={addWorkflow}
+                    className="w-full py-3 border-2 border-dashed border-gray-200 rounded-xl text-gray-400 hover:text-indigo-600 hover:border-indigo-200 hover:bg-indigo-50/30 transition-all flex items-center justify-center gap-2 font-medium"
                   >
-                    <Wand2 className="w-4 h-4" />
-                    Translate Subtitles
+                    <Plus className="w-4 h-4" />
+                    Add Translation Workflow
                   </button>
-                )}
+                </div>
               </div>
             )}
           </div>
@@ -540,7 +827,7 @@ export default function App() {
                     <TranscriptionEditor
                       title={`Translated (${targetLanguage})`}
                       subtitles={translatedSubtitles}
-                      onSubtitlesChange={setTranslatedSubtitles}
+                      onSubtitlesChange={handleTranslatedSubtitlesChange}
                       currentTime={currentTime}
                       onSeek={(time) => {
                         if (videoRef.current) {
@@ -576,8 +863,10 @@ export default function App() {
                   onResolutionChange={setResolution}
                   onExport={handleExport}
                   onExportSRT={handleExportSRT}
+                  onCancel={handleCancelExport}
                   isExporting={isExporting}
                   progress={exportProgress}
+                  hasVideo={!!videoFile}
                 />
               </motion.div>
             )}
@@ -589,6 +878,11 @@ export default function App() {
         isOpen={isSettingsOpen} 
         onClose={() => setIsSettingsOpen(false)} 
         onKeySave={setUserApiKey}
+      />
+
+      <UserManual 
+        isOpen={isManualOpen}
+        onClose={() => setIsManualOpen(false)}
       />
     </div>
   );
